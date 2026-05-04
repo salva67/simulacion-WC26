@@ -31,6 +31,22 @@ worldcup_2026_montecarlo_streamlit/
     └── simulator.py
 ```
 
+
+## Cómo operar la app
+
+La guía completa está en [`docs/manual_operacion.md`](docs/manual_operacion.md).
+
+Resumen de uso:
+
+1. Abrir la app con `streamlit run app.py`.
+2. Revisar los equipos cargados en la pestaña **Datos**.
+3. Ajustar los parámetros desde el panel lateral.
+4. Leer probabilidades en las pestañas **Título**, **Rondas** y **Grupos**.
+5. Usar **Simulación ejemplo** solo como auditoría de un escenario individual.
+6. Descargar resultados o reemplazar el CSV base por uno propio si se quiere usar otro rating.
+
+La interpretación correcta es probabilística: una probabilidad de campeón de 12% significa que esa selección salió campeona en aproximadamente 12 de cada 100 torneos simulados, no que el modelo asegure que será campeona.
+
 ## Modelo
 
 El rating base de cada selección se calcula con puntos FIFA. La app permite modificar:

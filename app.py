@@ -57,6 +57,36 @@ def main():
         "Motor probabilístico para simular todo el torneo: fase de grupos, mejores terceros, 32avos, bracket y campeón."
     )
 
+
+    with st.expander("ℹ️ Cómo operar la app", expanded=False):
+        st.markdown(
+            """
+            **Flujo recomendado**
+
+            1. **Revisá los datos base** en la pestaña **Datos**. Ahí están las 48 selecciones, grupo, posición, ranking FIFA, puntos FIFA y flag de anfitrión.
+            2. **Ajustá los parámetros** desde el panel lateral izquierdo. Para una prueba rápida usá 1.000 a 5.000 simulaciones; para conclusiones más estables usá 10.000 o más.
+            3. **Interpretá los resultados por probabilidad**, no como un único pronóstico. Si un equipo tiene 15% de campeón, significa que ganó 15 de cada 100 torneos simulados aproximadamente.
+            4. **Usá la pestaña Título** para ver candidatos principales al campeonato.
+            5. **Usá la pestaña Rondas** para analizar chances de llegar a 32avos, 16avos, cuartos, semifinal, final o campeón.
+            6. **Usá la pestaña Grupos** para revisar probabilidades de terminar 1°, 2°, 3° o 4° en cada grupo.
+            7. **Usá Simulación ejemplo** solo para auditar un escenario individual partido por partido.
+            8. **Cargá un CSV propio** desde el panel lateral si querés usar ratings actualizados, ELO, odds o una ponderación propia.
+
+            **Parámetros principales**
+
+            - **Cantidad de simulaciones:** más simulaciones dan probabilidades más estables, pero tardan más.
+            - **Seed:** permite reproducir exactamente el mismo resultado.
+            - **Goles promedio base:** sube o baja la cantidad esperada de goles por partido.
+            - **Sensibilidad a diferencia de ranking:** controla cuánto pesa la diferencia entre selecciones fuertes y débiles.
+            - **Ventaja local:** suma rating a México, Estados Unidos y Canadá.
+            - **Aleatoriedad en alargue/penales:** regula cuánto influye el rating cuando un cruce de eliminación directa termina empatado.
+
+            **Lectura correcta**
+
+            La app no dice “este será el campeón”. Estima escenarios posibles. El mejor uso es comparar probabilidades, caminos al título y sensibilidad ante cambios de parámetros o ratings.
+            """
+        )
+
     default_teams = load_default_teams()
 
     with st.sidebar:
