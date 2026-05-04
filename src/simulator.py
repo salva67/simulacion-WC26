@@ -1,15 +1,15 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 
 
 GROUP_FIXTURES_BY_POSITION = [(1, 2), (3, 4), (1, 3), (4, 2), (4, 1), (2, 3)]
 
-# Round of 32 bracket from official published bracket slots.
+# Round of 32 bracket from the published 2026 bracket slots.
 R32_MATCHES = [
     (73, "2A", "2B"),
     (74, "1C", "2F"),
@@ -74,6 +74,7 @@ class ModelParams:
     rating_scale: float = 375.0
     host_advantage_points: float = 35.0
     knockout_penalty_scale: float = 450.0
+    elo_weight: float = 0.50
     seed: int = 42
 
 
@@ -84,12 +85,44 @@ def clean_teams(df: pd.DataFrame) -> pd.DataFrame:
     out["team"] = out["team"].astype(str)
     out["fifa_rank"] = out["fifa_rank"].astype(int)
     out["fifa_points"] = out["fifa_points"].astype(float)
+    if "elo_rating" not in out.columns:
+        out["elo_rating"] = np.nan
+    out["elo_rating"] = pd.to_numeric(out["elo_rating"], errors="coerce")
     out["is_host"] = out["is_host"].astype(int)
     return out.sort_values(["group", "position"]).reset_index(drop=True)
 
 
+def _minmax(series: pd.Series) -> pd.Series:
+    series = pd.to_numeric(series, errors="coerce")
+    if series.isna().all():
+        return pd.Series(0.5, index=series.index)
+    series = series.fillna(series.median())
+    min_v = float(series.min())
+    max_v = float(series.max())
+    if abs(max_v - min_v) < 1e-9:
+        return pd.Series(0.5, index=series.index)
+    return (series - min_v) / (max_v - min_v)
+
+
+def add_model_rating(teams_df: pd.DataFrame, params: ModelParams) -> pd.DataFrame:
+    """Create the common-scale rating used by the simulation engine."""
+    out = clean_teams(teams_df)
+    elo_weight = float(np.clip(params.elo_weight, 0.0, 1.0))
+    fifa_weight = 1.0 - elo_weight
+
+    fifa_norm = _minmax(out["fifa_points"])
+    elo_norm = _minmax(out["elo_rating"]) if out["elo_rating"].notna().any() else fifa_norm.copy()
+
+    out["rating_fifa_norm"] = fifa_norm
+    out["rating_elo_norm"] = elo_norm
+    out["rating_final_norm"] = fifa_weight * fifa_norm + elo_weight * elo_norm
+    out["model_rating"] = 1300.0 + out["rating_final_norm"] * 900.0
+    return out
+
+
 def adjusted_rating(row: pd.Series, params: ModelParams) -> float:
-    return float(row["fifa_points"]) + float(row.get("is_host", 0)) * params.host_advantage_points
+    base = float(row.get("model_rating", row.get("fifa_points", 1500.0)))
+    return base + float(row.get("is_host", 0)) * params.host_advantage_points
 
 
 def expected_goals(row_a: pd.Series, row_b: pd.Series, params: ModelParams) -> Tuple[float, float]:
@@ -103,108 +136,33 @@ def expected_goals(row_a: pd.Series, row_b: pd.Series, params: ModelParams) -> T
 
 def simulate_score(row_a: pd.Series, row_b: pd.Series, rng: np.random.Generator, params: ModelParams) -> Tuple[int, int]:
     lam_a, lam_b = expected_goals(row_a, row_b, params)
-    goals_a = int(rng.poisson(lam_a))
-    goals_b = int(rng.poisson(lam_b))
-    return goals_a, goals_b
+    return int(rng.poisson(lam_a)), int(rng.poisson(lam_b))
 
 
-def knockout_tiebreak(row_a: pd.Series, row_b: pd.Series, rng: np.random.Generator, params: ModelParams) -> str:
-    # Logistic/Elo-style probability for extra time + penalties.
-    ra = adjusted_rating(row_a, params)
-    rb = adjusted_rating(row_b, params)
-    p_a = 1.0 / (1.0 + 10.0 ** (-(ra - rb) / params.knockout_penalty_scale))
-    return str(row_a["team"]) if rng.random() < p_a else str(row_b["team"])
+def _expected_from_ratings(rating_a: float, rating_b: float, params: ModelParams) -> Tuple[float, float]:
+    diff = float(np.clip((rating_a - rating_b) / params.rating_scale, -2.2, 2.2))
+    return params.base_goals * float(np.exp(diff / 2.0)), params.base_goals * float(np.exp(-diff / 2.0))
 
 
-def simulate_knockout_match(
-    row_a: pd.Series,
-    row_b: pd.Series,
-    rng: np.random.Generator,
-    params: ModelParams,
-) -> Tuple[str, str, str]:
-    ga, gb = simulate_score(row_a, row_b, rng, params)
-    if ga > gb:
-        winner, loser = str(row_a["team"]), str(row_b["team"])
-        score = f"{ga}-{gb}"
-    elif gb > ga:
-        winner, loser = str(row_b["team"]), str(row_a["team"])
-        score = f"{ga}-{gb}"
-    else:
-        winner = knockout_tiebreak(row_a, row_b, rng, params)
-        loser = str(row_b["team"]) if winner == str(row_a["team"]) else str(row_a["team"])
-        score = f"{ga}-{gb} (pen)"
-    return winner, loser, score
+def _simulate_score_idx(i: int, j: int, ratings: np.ndarray, rng: np.random.Generator, params: ModelParams) -> Tuple[int, int]:
+    lam_i, lam_j = _expected_from_ratings(float(ratings[i]), float(ratings[j]), params)
+    return int(rng.poisson(lam_i)), int(rng.poisson(lam_j))
 
 
-def simulate_group(
-    group_df: pd.DataFrame,
-    team_lookup: Dict[str, pd.Series],
-    rng: np.random.Generator,
-    params: ModelParams,
-) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
-    teams = group_df.sort_values("position")
-    pos_to_team = dict(zip(teams["position"], teams["team"]))
-    table = {
-        team: {"team": team, "group": str(teams.iloc[0]["group"]), "pts": 0, "gf": 0, "ga": 0, "gd": 0}
-        for team in teams["team"]
-    }
-    matches = []
-
-    for i, (pa, pb) in enumerate(GROUP_FIXTURES_BY_POSITION, start=1):
-        ta, tb = pos_to_team[pa], pos_to_team[pb]
-        row_a, row_b = team_lookup[ta], team_lookup[tb]
-        ga, gb = simulate_score(row_a, row_b, rng, params)
-
-        table[ta]["gf"] += ga
-        table[ta]["ga"] += gb
-        table[tb]["gf"] += gb
-        table[tb]["ga"] += ga
-        table[ta]["gd"] = table[ta]["gf"] - table[ta]["ga"]
-        table[tb]["gd"] = table[tb]["gf"] - table[tb]["ga"]
-
-        if ga > gb:
-            table[ta]["pts"] += 3
-        elif gb > ga:
-            table[tb]["pts"] += 3
-        else:
-            table[ta]["pts"] += 1
-            table[tb]["pts"] += 1
-
-        matches.append(
-            {
-                "round": "Grupo",
-                "group": str(teams.iloc[0]["group"]),
-                "matchday": i,
-                "team_a": ta,
-                "team_b": tb,
-                "score": f"{ga}-{gb}",
-                "winner": ta if ga > gb else tb if gb > ga else "Empate",
-            }
-        )
-
-    standings = pd.DataFrame(table.values())
-    standings = standings.merge(
-        group_df[["team", "fifa_rank", "fifa_points"]], on="team", how="left"
-    )
-    standings["_random_tiebreak"] = rng.random(len(standings))
-    # Simplified FIFA-style ranking: points, goal difference, goals for, FIFA points/rank as final tie-break proxy.
-    standings = standings.sort_values(
-        ["pts", "gd", "gf", "fifa_points", "_random_tiebreak"],
-        ascending=[False, False, False, False, False],
-    ).reset_index(drop=True)
-    standings["group_pos"] = np.arange(1, len(standings) + 1)
-    standings = standings.drop(columns=["_random_tiebreak"])
-    return standings, matches
+def _knockout_winner(i: int, j: int, ratings: np.ndarray, rng: np.random.Generator, params: ModelParams) -> Tuple[int, int, str]:
+    gi, gj = _simulate_score_idx(i, j, ratings, rng, params)
+    if gi > gj:
+        return i, j, f"{gi}-{gj}"
+    if gj > gi:
+        return j, i, f"{gi}-{gj}"
+    p_i = 1.0 / (1.0 + 10.0 ** (-(float(ratings[i]) - float(ratings[j])) / params.knockout_penalty_scale))
+    winner = i if rng.random() < p_i else j
+    loser = j if winner == i else i
+    return winner, loser, f"{gi}-{gj} (pen)"
 
 
 def assign_third_place_tokens(advanced_groups: List[str]) -> Dict[str, str]:
-    """
-    Assign each '3ABC...' token to one of the eight actual third-place groups.
-
-    FIFA publishes a full Annex C matrix. This implementation respects the official
-    eligibility set encoded in each bracket token and uses deterministic backtracking
-    so every advancing third-placed group is used once.
-    """
+    """Assign each bracket third-place slot to an actual advancing group."""
     groups = sorted(set(advanced_groups))
     candidates = {token: sorted([g for g in groups if g in set(token[1:])]) for token in THIRD_TOKENS}
     tokens_by_constraint = sorted(THIRD_TOKENS, key=lambda t: (len(candidates[t]), t))
@@ -214,7 +172,6 @@ def assign_third_place_tokens(advanced_groups: List[str]) -> Dict[str, str]:
         if i == len(tokens_by_constraint):
             return True
         token = tokens_by_constraint[i]
-        # Stable preference: use groups with fewer remaining slots first.
         cand = sorted(
             [g for g in candidates[token] if g not in used],
             key=lambda g: (sum(g in candidates[t] for t in tokens_by_constraint[i + 1 :]), g),
@@ -229,23 +186,156 @@ def assign_third_place_tokens(advanced_groups: List[str]) -> Dict[str, str]:
         return False
 
     if not backtrack(0, set()):
-        raise RuntimeError(f"No se pudo asignar terceros para grupos: {groups}")
+        # Fallback: deterministic assignment among eligible available groups. This keeps the
+        # simulation running if a rare combination is not covered by the simplified slot matrix.
+        available = groups.copy()
+        solution.clear()
+        for token in THIRD_TOKENS:
+            elig = [g for g in available if g in set(token[1:])]
+            chosen = elig[0] if elig else available[0]
+            solution[token] = chosen
+            available.remove(chosen)
     return solution
 
 
-def resolve_slot(
-    token: str,
-    group_rankings: Dict[str, pd.DataFrame],
-    third_assignment: Dict[str, str],
-) -> str:
-    if token.startswith("1") or token.startswith("2"):
-        pos = int(token[0])
-        grp = token[1]
-        return str(group_rankings[grp].query("group_pos == @pos").iloc[0]["team"])
-    if token.startswith("3"):
-        grp = third_assignment[token]
-        return str(group_rankings[grp].query("group_pos == 3").iloc[0]["team"])
-    raise ValueError(f"Token no reconocido: {token}")
+class TournamentEngine:
+    def __init__(self, teams_df: pd.DataFrame, params: ModelParams):
+        self.params = params
+        self.teams_df = add_model_rating(teams_df, params)
+        self.n = len(self.teams_df)
+        self.names = self.teams_df["team"].tolist()
+        self.groups = self.teams_df["group"].tolist()
+        self.fifa_rank = self.teams_df["fifa_rank"].to_numpy(dtype=int)
+        self.fifa_points = self.teams_df["fifa_points"].to_numpy(dtype=float)
+        self.elo_rating = self.teams_df["elo_rating"].to_numpy(dtype=float)
+        self.model_rating = self.teams_df["model_rating"].to_numpy(dtype=float)
+        self.is_host = self.teams_df["is_host"].to_numpy(dtype=float)
+        self.ratings = self.model_rating + self.is_host * params.host_advantage_points
+        self.group_to_indices: Dict[str, List[int]] = {
+            g: self.teams_df.index[self.teams_df["group"] == g].tolist()
+            for g in sorted(self.teams_df["group"].unique())
+        }
+
+    def _resolve_slot(self, token: str, group_rankings: Dict[str, List[int]], third_assignment: Dict[str, str]) -> int:
+        if token.startswith("1") or token.startswith("2"):
+            pos = int(token[0]) - 1
+            grp = token[1]
+            return group_rankings[grp][pos]
+        if token.startswith("3"):
+            grp = third_assignment[token]
+            return group_rankings[grp][2]
+        raise ValueError(f"Token no reconocido: {token}")
+
+    def simulate_once(self, rng: np.random.Generator, keep_trace: bool = False) -> Tuple[np.ndarray, np.ndarray, Optional[pd.DataFrame]]:
+        stage = np.zeros(self.n, dtype=np.int8)
+        group_pos = np.zeros(self.n, dtype=np.int8)
+        trace: List[Dict[str, Any]] = []
+        group_rankings: Dict[str, List[int]] = {}
+        third_candidates: List[Dict[str, Any]] = []
+
+        for grp, idxs in self.group_to_indices.items():
+            pts = {i: 0 for i in idxs}
+            gf = {i: 0 for i in idxs}
+            ga = {i: 0 for i in idxs}
+
+            pos_to_idx = {pos + 1: idxs[pos] for pos in range(4)}
+            for md, (pa, pb) in enumerate(GROUP_FIXTURES_BY_POSITION, start=1):
+                i, j = pos_to_idx[pa], pos_to_idx[pb]
+                gi, gj = _simulate_score_idx(i, j, self.ratings, rng, self.params)
+                gf[i] += gi; ga[i] += gj
+                gf[j] += gj; ga[j] += gi
+                if gi > gj:
+                    pts[i] += 3
+                    winner = self.names[i]
+                elif gj > gi:
+                    pts[j] += 3
+                    winner = self.names[j]
+                else:
+                    pts[i] += 1; pts[j] += 1
+                    winner = "Empate"
+                if keep_trace:
+                    trace.append({
+                        "round": "Grupo", "group": grp, "matchday": md,
+                        "team_a": self.names[i], "team_b": self.names[j],
+                        "score": f"{gi}-{gj}", "winner": winner,
+                    })
+
+            random_tie = {i: rng.random() for i in idxs}
+            ranking = sorted(
+                idxs,
+                key=lambda i: (pts[i], gf[i] - ga[i], gf[i], self.model_rating[i], random_tie[i]),
+                reverse=True,
+            )
+            group_rankings[grp] = ranking
+            for pos, i in enumerate(ranking, start=1):
+                group_pos[i] = pos
+                if pos <= 2:
+                    stage[i] = max(stage[i], 1)
+            third = ranking[2]
+            third_candidates.append({
+                "group": grp,
+                "idx": third,
+                "pts": pts[third],
+                "gd": gf[third] - ga[third],
+                "gf": gf[third],
+                "model_rating": self.model_rating[third],
+                "rand": rng.random(),
+            })
+
+        third_candidates.sort(key=lambda x: (x["pts"], x["gd"], x["gf"], x["model_rating"], x["rand"]), reverse=True)
+        advanced_thirds = [x["group"] for x in third_candidates[:8]]
+        for x in third_candidates[:8]:
+            stage[x["idx"]] = max(stage[x["idx"]], 1)
+        third_assignment = assign_third_place_tokens(advanced_thirds)
+
+        winners: Dict[int, int] = {}
+        losers: Dict[int, int] = {}
+
+        for match_no, token_a, token_b in R32_MATCHES:
+            i = self._resolve_slot(token_a, group_rankings, third_assignment)
+            j = self._resolve_slot(token_b, group_rankings, third_assignment)
+            winner, loser, score = _knockout_winner(i, j, self.ratings, rng, self.params)
+            winners[match_no], losers[match_no] = winner, loser
+            stage[winner] = max(stage[winner], 2)
+            if keep_trace:
+                trace.append({"round": "32avos", "match": match_no, "team_a": self.names[i], "team_b": self.names[j], "score": score, "winner": self.names[winner]})
+
+        for match_no, prev_a, prev_b in R16_MATCHES:
+            i, j = winners[prev_a], winners[prev_b]
+            winner, loser, score = _knockout_winner(i, j, self.ratings, rng, self.params)
+            winners[match_no], losers[match_no] = winner, loser
+            stage[winner] = max(stage[winner], 3)
+            if keep_trace:
+                trace.append({"round": "16avos", "match": match_no, "team_a": self.names[i], "team_b": self.names[j], "score": score, "winner": self.names[winner]})
+
+        for match_no, prev_a, prev_b in QF_MATCHES:
+            i, j = winners[prev_a], winners[prev_b]
+            winner, loser, score = _knockout_winner(i, j, self.ratings, rng, self.params)
+            winners[match_no], losers[match_no] = winner, loser
+            stage[winner] = max(stage[winner], 4)
+            if keep_trace:
+                trace.append({"round": "Cuartos", "match": match_no, "team_a": self.names[i], "team_b": self.names[j], "score": score, "winner": self.names[winner]})
+
+        for match_no, prev_a, prev_b in SF_MATCHES:
+            i, j = winners[prev_a], winners[prev_b]
+            winner, loser, score = _knockout_winner(i, j, self.ratings, rng, self.params)
+            winners[match_no], losers[match_no] = winner, loser
+            stage[winner] = max(stage[winner], 5)
+            if keep_trace:
+                trace.append({"round": "Semifinal", "match": match_no, "team_a": self.names[i], "team_b": self.names[j], "score": score, "winner": self.names[winner]})
+
+        final_no, prev_a, prev_b = FINAL_MATCH
+        i, j = winners[prev_a], winners[prev_b]
+        champion, runner_up, score = _knockout_winner(i, j, self.ratings, rng, self.params)
+        winners[final_no], losers[final_no] = champion, runner_up
+        stage[champion] = 6
+        if keep_trace:
+            trace.append({"round": "Final", "match": final_no, "team_a": self.names[i], "team_b": self.names[j], "score": score, "winner": self.names[champion]})
+            i3, j3 = losers[101], losers[102]
+            third_winner, _, score3 = _knockout_winner(i3, j3, self.ratings, rng, self.params)
+            trace.append({"round": "Tercer puesto", "match": 103, "team_a": self.names[i3], "team_b": self.names[j3], "score": score3, "winner": self.names[third_winner]})
+
+        return stage, group_pos, pd.DataFrame(trace) if keep_trace else None
 
 
 def simulate_tournament(
@@ -254,162 +344,54 @@ def simulate_tournament(
     params: ModelParams,
     keep_trace: bool = False,
 ) -> Tuple[Dict[str, int], Dict[str, int], Optional[pd.DataFrame]]:
-    teams_df = clean_teams(teams_df)
-    team_lookup = {row["team"]: row for _, row in teams_df.iterrows()}
-
-    stage = {team: 0 for team in teams_df["team"]}
-    group_positions: Dict[str, int] = {}
-    trace: List[Dict[str, Any]] = []
-
-    group_rankings: Dict[str, pd.DataFrame] = {}
-    for grp, gdf in teams_df.groupby("group", sort=True):
-        standings, matches = simulate_group(gdf, team_lookup, rng, params)
-        group_rankings[grp] = standings
-        if keep_trace:
-            trace.extend(matches)
-
-        for _, row in standings.iterrows():
-            team = str(row["team"])
-            pos = int(row["group_pos"])
-            group_positions[team] = pos
-            if pos <= 2:
-                stage[team] = max(stage[team], 1)
-
-    third_rows = []
-    for grp, standings in group_rankings.items():
-        third = standings.query("group_pos == 3").iloc[0].to_dict()
-        third["group"] = grp
-        third_rows.append(third)
-
-    thirds = pd.DataFrame(third_rows)
-    thirds["_random_tiebreak"] = rng.random(len(thirds))
-    thirds = thirds.sort_values(
-        ["pts", "gd", "gf", "fifa_points", "_random_tiebreak"],
-        ascending=[False, False, False, False, False],
-    ).reset_index(drop=True)
-    advanced_thirds = list(thirds.head(8)["group"])
-    third_assignment = assign_third_place_tokens(advanced_thirds)
-
-    for grp in advanced_thirds:
-        team = str(group_rankings[grp].query("group_pos == 3").iloc[0]["team"])
-        stage[team] = max(stage[team], 1)
-
-    winners: Dict[int, str] = {}
-    losers: Dict[int, str] = {}
-
-    # Round of 32.
-    for match_no, token_a, token_b in R32_MATCHES:
-        ta = resolve_slot(token_a, group_rankings, third_assignment)
-        tb = resolve_slot(token_b, group_rankings, third_assignment)
-        winner, loser, score = simulate_knockout_match(team_lookup[ta], team_lookup[tb], rng, params)
-        winners[match_no] = winner
-        losers[match_no] = loser
-        stage[winner] = max(stage[winner], 2)
-        if keep_trace:
-            trace.append({"round": "32avos", "match": match_no, "team_a": ta, "team_b": tb, "score": score, "winner": winner})
-
-    # Round of 16.
-    for match_no, prev_a, prev_b in R16_MATCHES:
-        ta, tb = winners[prev_a], winners[prev_b]
-        winner, loser, score = simulate_knockout_match(team_lookup[ta], team_lookup[tb], rng, params)
-        winners[match_no] = winner
-        losers[match_no] = loser
-        stage[winner] = max(stage[winner], 3)
-        if keep_trace:
-            trace.append({"round": "16avos", "match": match_no, "team_a": ta, "team_b": tb, "score": score, "winner": winner})
-
-    # Quarter-finals.
-    for match_no, prev_a, prev_b in QF_MATCHES:
-        ta, tb = winners[prev_a], winners[prev_b]
-        winner, loser, score = simulate_knockout_match(team_lookup[ta], team_lookup[tb], rng, params)
-        winners[match_no] = winner
-        losers[match_no] = loser
-        stage[winner] = max(stage[winner], 4)
-        if keep_trace:
-            trace.append({"round": "Cuartos", "match": match_no, "team_a": ta, "team_b": tb, "score": score, "winner": winner})
-
-    # Semi-finals.
-    for match_no, prev_a, prev_b in SF_MATCHES:
-        ta, tb = winners[prev_a], winners[prev_b]
-        winner, loser, score = simulate_knockout_match(team_lookup[ta], team_lookup[tb], rng, params)
-        winners[match_no] = winner
-        losers[match_no] = loser
-        stage[winner] = max(stage[winner], 5)
-        if keep_trace:
-            trace.append({"round": "Semifinal", "match": match_no, "team_a": ta, "team_b": tb, "score": score, "winner": winner})
-
-    # Final.
-    final_no, prev_a, prev_b = FINAL_MATCH
-    ta, tb = winners[prev_a], winners[prev_b]
-    champion, runner_up, score = simulate_knockout_match(team_lookup[ta], team_lookup[tb], rng, params)
-    winners[final_no] = champion
-    losers[final_no] = runner_up
-    stage[champion] = 6
-    if keep_trace:
-        trace.append({"round": "Final", "match": final_no, "team_a": ta, "team_b": tb, "score": score, "winner": champion})
-
-    # Optional third-place trace.
-    if keep_trace:
-        ta, tb = losers[101], losers[102]
-        winner, loser, score = simulate_knockout_match(team_lookup[ta], team_lookup[tb], rng, params)
-        trace.append({"round": "Tercer puesto", "match": 103, "team_a": ta, "team_b": tb, "score": score, "winner": winner})
-
-    trace_df = pd.DataFrame(trace) if keep_trace else None
-    return stage, group_positions, trace_df
+    engine = TournamentEngine(teams_df, params)
+    stage_arr, group_pos_arr, trace = engine.simulate_once(rng, keep_trace=keep_trace)
+    stage = {engine.names[i]: int(stage_arr[i]) for i in range(engine.n)}
+    group_positions = {engine.names[i]: int(group_pos_arr[i]) for i in range(engine.n)}
+    return stage, group_positions, trace
 
 
-def run_monte_carlo(
-    teams_df: pd.DataFrame,
-    params: ModelParams,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    teams_df = clean_teams(teams_df)
+def run_monte_carlo(teams_df: pd.DataFrame, params: ModelParams) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(params.seed)
+    engine = TournamentEngine(teams_df, params)
 
-    teams = list(teams_df["team"])
-    stage_counts = {team: {level: 0 for level in range(7)} for team in teams}
-    group_pos_counts = {team: {pos: 0 for pos in [1, 2, 3, 4]} for team in teams}
-    sample_trace = None
+    stage_counts = np.zeros((engine.n, 7), dtype=np.int32)
+    group_pos_counts = np.zeros((engine.n, 5), dtype=np.int32)
+    sample_trace: Optional[pd.DataFrame] = None
 
-    for sim in range(params.n_sims):
-        stage, group_positions, trace = simulate_tournament(
-            teams_df, rng, params, keep_trace=(sim == 0)
-        )
+    for sim in range(int(params.n_sims)):
+        stage, group_pos, trace = engine.simulate_once(rng, keep_trace=(sim == 0))
         if sim == 0:
             sample_trace = trace
-
-        for team, highest_stage in stage.items():
-            for level in range(highest_stage + 1):
-                stage_counts[team][level] += 1
-        for team, pos in group_positions.items():
-            group_pos_counts[team][pos] += 1
+        for i, highest_stage in enumerate(stage):
+            stage_counts[i, : int(highest_stage) + 1] += 1
+        for i, pos in enumerate(group_pos):
+            group_pos_counts[i, int(pos)] += 1
 
     rows = []
-    for _, trow in teams_df.iterrows():
-        team = str(trow["team"])
-        rows.append(
-            {
-                "team": team,
-                "group": trow["group"],
-                "fifa_rank": int(trow["fifa_rank"]),
-                "fifa_points": float(trow["fifa_points"]),
-                "p_r32": stage_counts[team][1] / params.n_sims,
-                "p_r16": stage_counts[team][2] / params.n_sims,
-                "p_qf": stage_counts[team][3] / params.n_sims,
-                "p_sf": stage_counts[team][4] / params.n_sims,
-                "p_final": stage_counts[team][5] / params.n_sims,
-                "p_champion": stage_counts[team][6] / params.n_sims,
-            }
-        )
+    for i, row in engine.teams_df.iterrows():
+        rows.append({
+            "team": engine.names[i],
+            "group": engine.groups[i],
+            "fifa_rank": int(engine.fifa_rank[i]),
+            "fifa_points": float(engine.fifa_points[i]),
+            "elo_rating": float(engine.elo_rating[i]) if not np.isnan(engine.elo_rating[i]) else np.nan,
+            "model_rating": float(engine.model_rating[i]),
+            "p_r32": stage_counts[i, 1] / params.n_sims,
+            "p_r16": stage_counts[i, 2] / params.n_sims,
+            "p_qf": stage_counts[i, 3] / params.n_sims,
+            "p_sf": stage_counts[i, 4] / params.n_sims,
+            "p_final": stage_counts[i, 5] / params.n_sims,
+            "p_champion": stage_counts[i, 6] / params.n_sims,
+        })
     probs = pd.DataFrame(rows).sort_values("p_champion", ascending=False).reset_index(drop=True)
 
     gpos_rows = []
-    for _, trow in teams_df.iterrows():
-        team = str(trow["team"])
-        rec = {"team": team, "group": trow["group"]}
+    for i in range(engine.n):
+        rec = {"team": engine.names[i], "group": engine.groups[i]}
         for pos in [1, 2, 3, 4]:
-            rec[f"p_group_{pos}"] = group_pos_counts[team][pos] / params.n_sims
+            rec[f"p_group_{pos}"] = group_pos_counts[i, pos] / params.n_sims
         rec["p_top2"] = rec["p_group_1"] + rec["p_group_2"]
         gpos_rows.append(rec)
-
     group_probs = pd.DataFrame(gpos_rows).sort_values(["group", "p_group_1"], ascending=[True, False])
     return probs, group_probs, sample_trace if sample_trace is not None else pd.DataFrame()

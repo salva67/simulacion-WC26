@@ -26,11 +26,12 @@ worldcup_2026_montecarlo_streamlit/
 ├── requirements.txt
 ├── data/
 │   └── teams_2026.csv
+├── docs/
+│   └── manual_operacion.md
 └── src/
     ├── __init__.py
     └── simulator.py
 ```
-
 
 ## Cómo operar la app
 
@@ -41,36 +42,52 @@ Resumen de uso:
 1. Abrir la app con `streamlit run app.py`.
 2. Revisar los equipos cargados en la pestaña **Datos**.
 3. Ajustar los parámetros desde el panel lateral.
-4. Leer probabilidades en las pestañas **Título**, **Rondas** y **Grupos**.
-5. Usar **Simulación ejemplo** solo como auditoría de un escenario individual.
-6. Descargar resultados o reemplazar el CSV base por uno propio si se quiere usar otro rating.
+4. Definir el **Peso ELO** del rating compuesto.
+5. Leer probabilidades en las pestañas **Título**, **Rondas** y **Grupos**.
+6. Usar **Simulación ejemplo** solo como auditoría de un escenario individual.
+7. Descargar resultados o reemplazar el CSV base por uno propio si se quiere usar otro rating.
 
 La interpretación correcta es probabilística: una probabilidad de campeón de 12% significa que esa selección salió campeona en aproximadamente 12 de cada 100 torneos simulados, no que el modelo asegure que será campeona.
 
 ## Modelo
 
-El rating base de cada selección se calcula con puntos FIFA. La app permite modificar:
+El modelo usa un rating compuesto basado en:
 
-- cantidad de simulaciones
-- goles promedio por equipo
-- sensibilidad a diferencia de rating
-- ventaja local para México, USA y Canadá
-- aleatoriedad en alargue/penales
-- seed para reproducibilidad
+- `fifa_points`: puntos del ranking FIFA;
+- `elo_rating`: rating World Football Elo;
+- `is_host`: ventaja configurable para México, Estados Unidos y Canadá.
 
-## Cómo mejorar el modelo
-
-El CSV `teams_2026.csv` puede reemplazarse por un archivo propio con un rating más rico, por ejemplo:
+Como FIFA y ELO están en escalas distintas, el motor normaliza ambas variables de 0 a 1 dentro del universo de 48 selecciones y luego calcula:
 
 ```text
-rating_final = 0.55 * fifa_points + 0.25 * elo + 0.15 * market_value_index + 0.05 * recent_form
+rating_final_norm = (1 - peso_elo) * fifa_points_norm + peso_elo * elo_rating_norm
+model_rating = 1300 + rating_final_norm * 900
 ```
 
-También podés sumar columnas y adaptar `src/simulator.py` para incluir:
+La app permite modificar:
 
-- odds de casas de apuestas
-- ELO internacional
-- forma últimos 10 partidos
-- ventaja por sede/distancia
-- bajas por lesiones
-- ranking de ataque y defensa separado
+- cantidad de simulaciones;
+- peso ELO dentro del rating compuesto;
+- goles promedio por equipo;
+- sensibilidad a diferencia de rating;
+- ventaja local para México, USA y Canadá;
+- aleatoriedad en alargue/penales;
+- seed para reproducibilidad.
+
+## Datos propios
+
+El CSV `teams_2026.csv` puede reemplazarse por un archivo propio con las mismas columnas. La columna `elo_rating` es recomendada. Si falta, la app sigue corriendo y usa un proxy basado en FIFA.
+
+Columnas esperadas:
+
+```text
+group,position,team,team_code,confederation,fifa_rank,fifa_points,elo_rating,is_host
+```
+
+También podés adaptar `src/simulator.py` para incluir:
+
+- odds de casas de apuestas;
+- forma últimos 10 partidos;
+- ventaja por sede/distancia;
+- bajas por lesiones;
+- ranking de ataque y defensa separado.

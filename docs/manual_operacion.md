@@ -43,6 +43,7 @@ Entrar a la pestaña **Datos** y revisar que estén cargadas las 48 selecciones 
 - `confederation`: confederación;
 - `fifa_rank`: ranking FIFA;
 - `fifa_points`: puntos FIFA o rating equivalente;
+- `elo_rating`: rating World Football Elo;
 - `is_host`: 1 si es anfitrión, 0 en caso contrario.
 
 Si se quiere usar una fuente propia de fuerza de equipo, se puede cargar otro CSV desde el panel lateral.
@@ -69,12 +70,22 @@ Controla el nivel general de goles simulados por partido.
 - Más bajo: partidos más cerrados.
 - Más alto: partidos con más goles y más varianza.
 
-#### Sensibilidad a diferencia de ranking
+#### Sensibilidad a diferencia de rating
 
-Controla cuánto pesa la diferencia de rating entre dos selecciones.
+Controla cuánto pesa la diferencia de rating compuesto entre dos selecciones.
 
 - Valor bajo: los favoritos tienen más ventaja.
 - Valor alto: el torneo se vuelve más aleatorio.
+
+#### Peso ELO
+
+Define cuánto pesa el rating ELO dentro del rating compuesto.
+
+- 0%: usa solo puntos FIFA normalizados.
+- 50%: combina FIFA y ELO en partes iguales.
+- 100%: usa solo ELO normalizado.
+
+El motor normaliza FIFA y ELO antes de combinarlos para evitar que una escala domine a la otra por tener valores más altos.
 
 #### Ventaja local
 
@@ -99,7 +110,8 @@ En la parte superior se muestran indicadores principales:
 - favorito al título;
 - equipo con mayor probabilidad de llegar a la final;
 - cantidad de simulaciones ejecutadas;
-- cantidad de equipos cargados.
+- cantidad de equipos cargados;
+- peso ELO usado en la corrida.
 
 ## 4. Cómo interpretar cada pestaña
 
@@ -146,23 +158,23 @@ La opción más simple es descargar `teams_2026.csv`, modificar los valores de r
 El archivo debe mantener las mismas columnas obligatorias:
 
 ```text
-group,position,team,team_code,confederation,fifa_rank,fifa_points,is_host
+group,position,team,team_code,confederation,fifa_rank,fifa_points,elo_rating,is_host
 ```
 
-Para mejorar el modelo, `fifa_points` puede reemplazarse por un rating propio. Por ejemplo:
+Para mejorar el modelo, se puede actualizar `elo_rating` con una fuente más reciente o agregar nuevas columnas y modificar el motor. Una evolución posible sería:
 
 ```text
-rating_final = 0.55 * puntos_fifa + 0.25 * elo + 0.15 * forma_reciente + 0.05 * valor_plantel
+rating_final = 0.45 * puntos_fifa + 0.35 * elo + 0.15 * forma_reciente + 0.05 * valor_plantel
 ```
 
-En ese caso, cargar ese rating en la columna `fifa_points` para reutilizar el motor sin modificar código.
+En la versión actual, la app ya combina `fifa_points` y `elo_rating` con el slider **Peso ELO**.
 
 ## 6. Buenas prácticas de análisis
 
 - Usar al menos 10.000 simulaciones para conclusiones finales.
 - Comparar escenarios cambiando solo un parámetro por vez.
 - Guardar la seed cuando se quiera reproducir un resultado.
-- Actualizar el CSV si cambia el ranking FIFA, hay lesiones importantes o se quiere incorporar odds.
+- Actualizar el CSV si cambia el ranking FIFA, cambia el ELO, hay lesiones importantes o se quiere incorporar odds.
 - No interpretar una única simulación como pronóstico final.
 
 ## 7. Limitaciones actuales
@@ -175,8 +187,8 @@ En ese caso, cargar ese rating en la columna `fifa_points` para reutilizar el mo
 
 ## 8. Próximas mejoras sugeridas
 
-- Incorporar ELO internacional.
 - Separar rating ofensivo y defensivo.
+- Calibrar pesos FIFA/ELO con backtesting histórico.
 - Agregar odds de apuestas como calibración externa.
 - Incorporar forma reciente de últimos partidos.
 - Simular sede, viajes y descanso entre partidos.

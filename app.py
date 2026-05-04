@@ -44,7 +44,7 @@ def render_probability_chart(df: pd.DataFrame, metric: str, title: str):
         .encode(
             x=alt.X("prob:Q", title="Probabilidad (%)"),
             y=alt.Y("team:N", sort="-x", title="Selección"),
-            tooltip=["team", "group", "fifa_rank", alt.Tooltip("prob:Q", format=".2f")],
+            tooltip=["team", "group", "fifa_rank", "elo_rating", "model_rating", alt.Tooltip("prob:Q", format=".2f")],
         )
         .properties(height=520, title=title)
     )
@@ -63,7 +63,7 @@ def main():
             """
             **Flujo recomendado**
 
-            1. **Revisá los datos base** en la pestaña **Datos**. Ahí están las 48 selecciones, grupo, posición, ranking FIFA, puntos FIFA y flag de anfitrión.
+            1. **Revisá los datos base** en la pestaña **Datos**. Ahí están las 48 selecciones, grupo, posición, ranking FIFA, puntos FIFA, rating ELO y flag de anfitrión.
             2. **Ajustá los parámetros** desde el panel lateral izquierdo. Para una prueba rápida usá 1.000 a 5.000 simulaciones; para conclusiones más estables usá 10.000 o más.
             3. **Interpretá los resultados por probabilidad**, no como un único pronóstico. Si un equipo tiene 15% de campeón, significa que ganó 15 de cada 100 torneos simulados aproximadamente.
             4. **Usá la pestaña Título** para ver candidatos principales al campeonato.
@@ -77,7 +77,8 @@ def main():
             - **Cantidad de simulaciones:** más simulaciones dan probabilidades más estables, pero tardan más.
             - **Seed:** permite reproducir exactamente el mismo resultado.
             - **Goles promedio base:** sube o baja la cantidad esperada de goles por partido.
-            - **Sensibilidad a diferencia de ranking:** controla cuánto pesa la diferencia entre selecciones fuertes y débiles.
+            - **Sensibilidad a diferencia de rating:** controla cuánto pesa la diferencia entre selecciones fuertes y débiles.
+            - **Peso ELO:** define cuánto pesa el rating ELO dentro del rating compuesto. Si está en 0%, el modelo usa solo FIFA; si está en 100%, usa solo ELO.
             - **Ventaja local:** suma rating a México, Estados Unidos y Canadá.
             - **Aleatoriedad en alargue/penales:** regula cuánto influye el rating cuando un cruce de eliminación directa termina empatado.
 
@@ -94,8 +95,9 @@ def main():
         n_sims = st.slider("Cantidad de simulaciones", 500, 50000, 5000, step=500)
         seed = st.number_input("Seed", value=42, min_value=0, step=1)
         base_goals = st.slider("Goles promedio base por equipo", 0.8, 2.2, 1.35, step=0.05)
-        rating_scale = st.slider("Sensibilidad a diferencia de ranking", 250.0, 650.0, 375.0, step=25.0)
-        host_adv = st.slider("Ventaja local para México/USA/Canadá en puntos FIFA", 0.0, 100.0, 35.0, step=5.0)
+        rating_scale = st.slider("Sensibilidad a diferencia de rating", 250.0, 650.0, 375.0, step=25.0)
+        elo_weight_pct = st.slider("Peso ELO en rating compuesto", 0, 100, 50, step=5)
+        host_adv = st.slider("Ventaja local para México/USA/Canadá en puntos de rating", 0.0, 100.0, 35.0, step=5.0)
         ko_scale = st.slider("Aleatoriedad en alargue/penales", 250.0, 800.0, 450.0, step=25.0)
 
         st.divider()
@@ -103,7 +105,7 @@ def main():
         uploaded = st.file_uploader(
             "Reemplazar teams_2026.csv",
             type=["csv"],
-            help="Debe tener: group, position, team, team_code, confederation, fifa_rank, fifa_points, is_host.",
+            help="Debe tener: group, position, team, team_code, confederation, fifa_rank, fifa_points, is_host. La columna elo_rating es recomendada, pero opcional.",
         )
 
     if uploaded is not None:
@@ -117,6 +119,7 @@ def main():
         rating_scale=float(rating_scale),
         host_advantage_points=float(host_adv),
         knockout_penalty_scale=float(ko_scale),
+        elo_weight=float(elo_weight_pct) / 100.0,
         seed=int(seed),
     )
 
@@ -125,13 +128,14 @@ def main():
 
     probs, group_probs, sample_trace = cached_simulation(csv_data, params_dict)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     champion = probs.iloc[0]
     c1.metric("Favorito al título", champion["team"], pct(champion["p_champion"]))
     c2.metric("Mayor prob. de final", probs.sort_values("p_final", ascending=False).iloc[0]["team"],
               pct(probs["p_final"].max()))
     c3.metric("Simulaciones", f"{n_sims:,}".replace(",", "."))
     c4.metric("Equipos", len(teams))
+    c5.metric("Peso ELO", f"{elo_weight_pct}%")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["🏆 Título", "📊 Rondas", "🧩 Grupos", "🗺️ Simulación ejemplo", "🧾 Datos"]
@@ -140,7 +144,7 @@ def main():
     with tab1:
         st.subheader("Probabilidad de campeón")
         render_probability_chart(probs, "p_champion", "Top 20 — probabilidad de campeón")
-        show_cols = ["team", "group", "fifa_rank", "fifa_points", "p_champion", "p_final", "p_sf", "p_qf", "p_r16", "p_r32"]
+        show_cols = ["team", "group", "fifa_rank", "fifa_points", "elo_rating", "model_rating", "p_champion", "p_final", "p_sf", "p_qf", "p_r16", "p_r32"]
         table = probs[show_cols].copy()
         for col in ["p_champion", "p_final", "p_sf", "p_qf", "p_r16", "p_r32"]:
             table[col] = table[col].map(pct)
@@ -201,8 +205,9 @@ def main():
     with tab5:
         st.subheader("Dataset base")
         st.write(
-            "El modelo usa grupos oficiales y ranking/puntos FIFA como fuerza base. "
-            "Podés reemplazar el CSV por uno propio con forma reciente, ELO externo, odds o lesiones."
+            "El modelo usa grupos oficiales, puntos FIFA y rating ELO como fuerza base. "
+            "Ambas escalas se normalizan y se combinan según el peso ELO elegido en el panel lateral. "
+            "Podés reemplazar el CSV por uno propio con forma reciente, ELO actualizado, odds o lesiones."
         )
         st.dataframe(teams, use_container_width=True, hide_index=True)
 
@@ -223,11 +228,13 @@ def main():
             - `confederation`: confederación
             - `fifa_rank`: ranking FIFA
             - `fifa_points`: puntos FIFA o rating equivalente
+            - `elo_rating`: rating ELO. Es recomendado; si falta, la app cae a un proxy basado en FIFA.
             - `is_host`: 1 para anfitrión, 0 para el resto
 
             **Notas metodológicas**
-            - Fase de grupos: goles simulados con Poisson usando puntos FIFA ajustados.
-            - Empates de grupo: se ordena por puntos, diferencia de gol, goles a favor y rating.
+            - Fase de grupos: goles simulados con Poisson usando un rating compuesto FIFA + ELO.
+            - Rating compuesto: FIFA y ELO se normalizan de 0 a 1 y luego se ponderan con el slider **Peso ELO**.
+            - Empates de grupo: se ordena por puntos, diferencia de gol, goles a favor y rating compuesto.
             - 32avos: se respetan los slots oficiales y los conjuntos elegibles de terceros.
             - Eliminatorias: si hay empate, se define por una probabilidad tipo Elo para alargue/penales.
             """
